@@ -1,5 +1,8 @@
 #include "y86.h"
-#include <conio.h> // 使用 _getch() 函数
+
+extern Y86 CPU;
+
+extern unsigned char DMEM[MEM_SIZE];
 
 int main()
 {

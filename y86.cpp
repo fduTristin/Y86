@@ -1,141 +1,289 @@
-#include"cache.h"
-#include"y86.h"
+#include "y86.h"
 
-cache_ cache;
-extern Y86 CPU;
+char inputfile[] = "test/new.yo";
+char outputfile[] = "output/result.json";
+nlohmann::json DATA; // output array
+Y86 CPU;
+unsigned char DMEM[MEM_SIZE];
+string reg[15] = {"rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi", "r8 ", "r9 ", "r10", "r11", "r12", "r13", "r14"};
 
-// final results
-int hits = 0;
-int misses = 0;
-int evictions = 0;
-
-void initialize_cache(int s, int e, int b, cache_ &c)
+string to_hex(int n)
 {
-    c.S = s;
-    c.E = e;
-    c.B = b;
-    c.cache_line = new line *[s];
-    for (int i = 0; i != c.S; i++)
+    string s;
+    int b03 = n & 15;
+    int b47 = n >> 4;
+    char s0 = b03 <= 9 ? '0' + b03 : 'A' + (b03 - 10);
+    char s1 = b47 <= 9 ? '0' + b47 : 'A' + (b47 - 10);
+    s.push_back(s0);
+    s.push_back(s1);
+    return s;
+}
+
+void save_instructions(string line)
+{
+    if (line[0] != '0')
+        return;
+    int addr = 0, i = 2;
+    while (line[i] != ':')
     {
-        c.cache_line[i] = new line[e];
-        for (int j = 0; j != c.E; j++)
-        {
-            c.cache_line[i][j].tag = MININT;
-            c.cache_line[i][j].valid = 0;
-            c.cache_line[i][j].recently_used = 0;
-        }
+        addr *= 16;
+        addr += line[i] >= '0' && line[i] <= '9' ? line[i] - '0' : (line[i] - 'a') + 10;
+        i++;
+    }
+    i += 2;
+    int offset = 0;
+    while (line[i] != ' ')
+    {
+        int byte;
+        byte = line[i] >= '0' && line[i] <= '9' ? line[i] - '0' : (line[i] - 'a') + 10;
+        byte *= 16;
+        i++;
+        byte += (line[i] >= '0' && line[i] <= '9' ? line[i] - '0' : (line[i] - 'a') + 10);
+        DMEM[addr + offset] = byte;
+        i++;
+        offset++;
     }
 }
 
-
-
-int full(int s)
+void input()
 {
-    for (int i = 0; i != cache.E; i++)
+    fstream infile(inputfile);
+    string line;
+    while (getline(infile, line))
     {
-        if (cache.cache_line[s][i].valid == 0)
-            return i;
+        if (line[0] != '0' && line[0] != ' ')
+            return;
+        save_instructions(line);
     }
-    return -1;
 }
 
-int find(int tag, int s)
+void create_output()
 {
-    for (int i = 0; i != cache.E; i++)
+    nlohmann::json mem;
+    for (int i = 0; i <= MEM_SIZE - 8; i += 8)
     {
-        if (cache.cache_line[s][i].tag == tag)
-            return i;
+        string s = to_string(i);
+        long long val = fetch_from_memory(i, 0);
+        if (val)
+            mem[s] = val;
     }
-    return -1;
+
+    nlohmann::json data =
+        {{"PC", CPU.PC},
+         {"REG", {{"rax", CPU.REG[0]}, {"rcx", CPU.REG[1]}, {"rdx", CPU.REG[2]}, {"rbx", CPU.REG[3]}, {"rsp", CPU.REG[4]}, {"rbp", CPU.REG[5]}, {"rsi", CPU.REG[6]}, {"rdi", CPU.REG[7]}, {"r8", CPU.REG[8]}, {"r9", CPU.REG[9]}, {"r10", CPU.REG[10]}, {"r11", CPU.REG[11]}, {"r12", CPU.REG[12]}, {"r13", CPU.REG[13]}, {"r14", CPU.REG[14]}}},
+         {"CC", {{"ZF", CPU.ZF}, {"SF", CPU.SF}, {"OF", CPU.OF}}},
+         {"STAT", CPU.state},
+         {"MEM", mem}};
+    DATA.push_back(data);
 }
 
-int find_LRU(int s)
+void output()
 {
-    int idx = 0;
-    for (int i = 0; i != cache.E; i++)
-    {
-        if (cache.cache_line[s][i].recently_used > cache.cache_line[s][idx].recently_used)
-            idx = i;
-    }
-    return idx;
+    ofstream outfile(outputfile);
+    outfile << std::setw(4) << DATA << endl;
 }
 
-long long update_block(int idx, int s, int tag)
+void save_to_memory(long long addr, long long info)
 {
-    for (int i = 0; i != cache.E; i++)
+    for (int i = 0; i != 8; i++)
     {
-        if (i != idx)
-        {
-            if (cache.cache_line[s][i].valid == 1)
-                cache.cache_line[s][i].recently_used++;
-        }
-        else
-        {
-            cache.cache_line[s][i].tag = tag;
-            cache.cache_line[s][i].recently_used = 0;
-            cache.cache_line[s][i].valid = 1;
-            long long addr = tag * cache.B * cache.S + s * cache.B;
-            cache.cache_line[s][i].block = fetch_from_memory(addr, 0);
-        }
+        DMEM[addr + i] = (info >> (8 * i)) & (0xff);
     }
-    return cache.cache_line[s][idx].block;
 }
 
-long long update(char op, int tag, int s)
+long long fetch_from_memory(long long addr, long long offset)
 {
-    int idx = find(tag, s);
-    if (idx != -1)
-    {
-        if (cache.cache_line[s][idx].valid == 1)
-        {
-            hits++;
-            return cache.cache_line[s][idx].block;
-        }
+    long long info = 0;
 
-        else
-        {
-            misses++;
-            return update_block(idx, s, tag);
-        }
+    for (int j = 0; j != 8; j++)
+    {
+        info += ((long long)DMEM[addr + offset + j]) << (8 * j);
     }
+
+    return info;
+}
+
+// functions which realize the instructions
+/*four integer operations*/
+void addq(long long &x, long long &y)
+{
+    long long t = x + y;
+    CPU.ZF = t == 0;
+    CPU.SF = t < 0;
+    CPU.OF = (x < 0 == y < 0) && (t < 0 != x < 0);
+    y = t;
+}
+void subq(long long &x, long long &y)
+{
+    long long t = y - x;
+    CPU.ZF = t == 0;
+    CPU.SF = t < 0;
+    CPU.OF = (t < y) != (x > 0);
+    y = t;
+}
+void andq(long long &x, long long &y)
+{
+    long long t = y & x;
+    y = t;
+    CPU.ZF = t == 0;
+    CPU.SF = t < 0;
+}
+void xorq(long long &x, long long &y)
+{
+    long long t = y ^ x;
+    y = t;
+    CPU.ZF = t == 0;
+    CPU.SF = t < 0;
+}
+
+/*seven jump instructions*/
+void jmp(long long addr)
+{
+    CPU.PC = addr;
+}
+void jle(long long addr)
+{
+    if ((CPU.SF ^ CPU.OF) | CPU.ZF)
+        CPU.PC = addr;
     else
-    {
-        int id = full(s);
-        if (id != -1)
-        {
-            misses++;
-            return update_block(id, s, tag);
-        }
-        else
-        {
-            id = find_LRU(s);
-            misses++;
-            evictions++;
-            return update_block(id, s, tag);
-        }
-    }
-    if (op == 'M')
-    {
-        hits++;
-    }
+        CPU.PC += 9;
 }
-
-void mrmovq(long long addr, long long &r, long long offset, cache_ &ca)
+void jl(long long addr)
 {
-    int tag = (addr + offset) / (cache.S * cache.B);
-    int set = ((addr + offset) / cache.B) % cache.S;
-    r = update('L', tag, set);
+    if (CPU.SF ^ CPU.OF)
+        CPU.PC = addr;
+    else
+        CPU.PC += 9;
+}
+void je(long long addr)
+{
+    if (CPU.ZF)
+        CPU.PC = addr;
+    else
+        CPU.PC += 9;
+}
+void jne(long long addr)
+{
+    if (!CPU.ZF)
+        CPU.PC = addr;
+    else
+        CPU.PC += 9;
+}
+void jge(long long addr)
+{
+    if (!(CPU.SF ^ CPU.OF))
+        CPU.PC = addr;
+    else
+        CPU.PC += 9;
+}
+void jg(long long addr)
+{
+    if (!(CPU.SF ^ CPU.OF) & !CPU.ZF)
+        CPU.PC = addr;
+    else
+        CPU.PC += 9;
 }
 
-void rmmovq(long long r, long long addr, long long offset, cache_ &ca)
+/*ten move instructions*/
+void rrmovq(long long &x, long long &y)
+{
+    y = x;
+}
+void irmovq(long long &x, long long &y)
+{
+    y = x;
+}
+void rmmovq(long long r, long long addr, long long offset)
 {
     save_to_memory(addr + offset, r);
-    int tag = (addr + offset) / (cache.S * cache.B);
-    int set = ((addr + offset) / cache.B) % cache.S;
-    update('S', tag, set);
+}
+void mrmovq(long long &addr, long long &r, long long offset)
+{
+    r = fetch_from_memory(addr, offset);
+}
+void cmovle(long long &x, long long &y)
+{
+    if ((CPU.SF ^ CPU.OF) | CPU.ZF)
+        y = x;
+}
+void cmovl(long long &x, long long &y)
+{
+    if (CPU.SF ^ CPU.OF)
+        y = x;
+}
+void cmove(long long &x, long long &y)
+{
+    if (CPU.ZF)
+        y = x;
+}
+void cmovne(long long &x, long long &y)
+{
+    if (!CPU.ZF)
+        y = x;
+}
+void cmovge(long long &x, long long &y)
+{
+    if (!(CPU.SF ^ CPU.OF))
+        y = x;
+}
+void cmovg(long long &x, long long &y)
+{
+    if (!(CPU.SF ^ CPU.OF) & !CPU.ZF)
+        y = x;
 }
 
-void decode_and_execute(cache_ &ca)
+/*pushq & popq*/
+void pushq(long long info)
+{
+    CPU.REG[4] -= 8;
+    save_to_memory(CPU.REG[4], info);
+}
+void popq(long long &addr)
+{
+    CPU.REG[4] += 8;
+    addr = fetch_from_memory(CPU.REG[4] - 8, 0);
+}
+
+/*call &ret*/
+void call(long long addr)
+{
+    long long Addr = CPU.PC + 9;
+    pushq(Addr);
+    CPU.PC = addr;
+}
+void ret()
+{
+    long long Addr;
+    popq(Addr);
+    CPU.PC = Addr;
+}
+
+/*halt*/
+void STAT_HLT()
+{
+    CPU.state = HLT;
+}
+
+/*nop*/
+void nop() {}
+
+/*excepting instruction*/
+void STAT_ADR()
+{
+    CPU.state = ADR;
+}
+void STAT_INS()
+{
+    CPU.state = INS;
+}
+
+// fetch,decode,execute
+unsigned char *fetch()
+{
+    return DMEM + CPU.PC;
+}
+
+void decode_and_execute()
 {
     unsigned char *code = fetch();
     int rA, rB, f;
@@ -256,7 +404,7 @@ void decode_and_execute(cache_ &ca)
             offset = fetch_from_memory(CPU.PC, 2);
             if (CPU.REG[rB] + offset < MEM_SIZE - 8)
             {
-                rmmovq(CPU.REG[rA], CPU.REG[rB], offset, cache);
+                rmmovq(CPU.REG[rA], CPU.REG[rB], offset);
                 CPU.PC += 10;
             }
             else
@@ -274,7 +422,7 @@ void decode_and_execute(cache_ &ca)
             offset = fetch_from_memory(CPU.PC, 2);
             if (CPU.REG[rB] + offset < MEM_SIZE - 8)
             {
-                mrmovq(CPU.REG[rB], CPU.REG[rA], offset, cache);
+                mrmovq(CPU.REG[rB], CPU.REG[rA], offset);
                 CPU.PC += 10;
             }
             else
